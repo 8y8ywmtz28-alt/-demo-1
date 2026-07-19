@@ -34,47 +34,70 @@ jobs:
         id: deploy
         shell: bash
         run: |
-          set +e
-          SLUG="worldcup-forecast-${GITHUB_SHA::8}"
-          : > response.json
-          : > curl-error.txt
-          : > live-url.txt
-          : > deployment-report.json
+          python3 - <<'PY'
+          import json
+          import os
+          import urllib.error
+          import urllib.request
+          from pathlib import Path
 
-          jq -n \
-            --rawfile html worldcup-real/index.html \
-            --arg slug "$SLUG" \
-            --arg title "World Cup Forecast Lab" \
-            --arg description "真实 Elo、近5场状态与 FIFA xG 驱动的世界杯概率模型" \
-            '{html:$html, slug:$slug, ogTitle:$title, ogDescription:$description}' > payload.json
-          JQ_EXIT=$?
+          report_path = Path('deployment-report.json')
+          live_path = Path('live-url.txt')
+          output_path = Path(os.environ['GITHUB_OUTPUT'])
+          report = {'status': 'unknown'}
+          status = 0
 
-          HTTP_CODE=$(curl -sS -o response.json -w '%{http_code}' \
-            -X POST 'https://pagedrop.dev/api/v1/sites' \
-            -H 'Content-Type: application/json' \
-            --data-binary @payload.json 2>curl-error.txt)
-          CURL_EXIT=$?
-          [ -n "$HTTP_CODE" ] || HTTP_CODE="000"
-          echo "http_code=$HTTP_CODE" >> "$GITHUB_OUTPUT"
+          try:
+              html = Path('worldcup-real/index.html').read_text(encoding='utf-8')
+              slug = f"worldcup-forecast-{os.environ['GITHUB_SHA'][:8].lower()}"
+              payload = json.dumps({
+                  'html': html,
+                  'slug': slug,
+                  'ogTitle': 'World Cup Forecast Lab',
+                  'ogDescription': '真实 Elo、近5场状态与 FIFA xG 驱动的世界杯概率模型',
+              }, ensure_ascii=False).encode('utf-8')
+              request = urllib.request.Request(
+                  'https://pagedrop.dev/api/v1/sites',
+                  data=payload,
+                  headers={'Content-Type': 'application/json', 'User-Agent': 'WorldCupForecastLab/1.0'},
+                  method='POST',
+              )
+              try:
+                  with urllib.request.urlopen(request, timeout=60) as response:
+                      status = response.status
+                      body = response.read().decode('utf-8', errors='replace')
+              except urllib.error.HTTPError as exc:
+                  status = exc.code
+                  body = exc.read().decode('utf-8', errors='replace')
 
-          if jq empty response.json >/dev/null 2>&1; then
-            jq --arg http "$HTTP_CODE" --argjson curlExit "$CURL_EXIT" --argjson jqExit "$JQ_EXIT" --rawfile curlError curl-error.txt \
-              'if .data then .data |= del(.deleteToken) else . end | . + {httpCode:$http,curlExit:$curlExit,jqExit:$jqExit,curlError:$curlError}' \
-              response.json > deployment-report.json
-          else
-            jq -n --arg http "$HTTP_CODE" --argjson curlExit "$CURL_EXIT" --argjson jqExit "$JQ_EXIT" --rawfile body response.json --rawfile curlError curl-error.txt \
-              '{httpCode:$http,curlExit:$curlExit,jqExit:$jqExit,curlError:$curlError,rawResponse:$body}' > deployment-report.json
-          fi
+              try:
+                  parsed = json.loads(body)
+              except json.JSONDecodeError:
+                  parsed = {'rawResponse': body}
+              if isinstance(parsed, dict) and isinstance(parsed.get('data'), dict):
+                  parsed['data'].pop('deleteToken', None)
+              report = {'httpCode': status, 'response': parsed}
 
-          if [ "$HTTP_CODE" = "201" ]; then
-            URL=$(jq -r '.data.url // empty' response.json)
-            echo "url=$URL" >> "$GITHUB_OUTPUT"
-            printf '%s\n' "$URL" > live-url.txt
-            echo "Deployment succeeded: $URL"
-          else
-            echo "PageDrop request completed with HTTP $HTTP_CODE and curl exit $CURL_EXIT."
-          fi
-          exit 0
+              if status == 201 and isinstance(parsed, dict):
+                  url = parsed.get('data', {}).get('url', '')
+                  if url:
+                      live_path.write_text(url + '\n', encoding='utf-8')
+                      with output_path.open('a', encoding='utf-8') as out:
+                          out.write(f'url={url}\n')
+                  else:
+                      report['error'] = '201 response contained no public URL'
+          except Exception as exc:
+              report = {
+                  'httpCode': status,
+                  'exceptionType': type(exc).__name__,
+                  'exception': str(exc),
+              }
+
+          report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding='utf-8')
+          with output_path.open('a', encoding='utf-8') as out:
+              out.write(f'http_code={status}\n')
+          print(json.dumps(report, ensure_ascii=False))
+          PY
 
       - name: Upload deployment diagnostics
         if: always()
