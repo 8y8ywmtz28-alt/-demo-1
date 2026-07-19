@@ -27,7 +27,6 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # Keep data provenance accessible on mobile while hiding the less essential share button.
           sed -i 's/class="btn desktop" id="sourceBtn"/class="btn" id="sourceBtn"/' worldcup-real/index.html
           sed -i 's/class="btn" id="shareBtn"/class="btn desktop" id="shareBtn"/' worldcup-real/index.html
 
@@ -35,7 +34,7 @@ jobs:
         id: deploy
         shell: bash
         run: |
-          set -euo pipefail
+          set -u
           SLUG="worldcup-forecast-${GITHUB_SHA::8}"
           jq -n \
             --rawfile html worldcup-real/index.html \
@@ -47,32 +46,46 @@ jobs:
           HTTP_CODE=$(curl -sS -o response.json -w '%{http_code}' \
             -X POST 'https://pagedrop.dev/api/v1/sites' \
             -H 'Content-Type: application/json' \
-            --data-binary @payload.json)
+            --data-binary @payload.json || printf '000')
+          echo "http_code=$HTTP_CODE" >> "$GITHUB_OUTPUT"
 
-          if [ "$HTTP_CODE" != "201" ]; then
-            echo "PageDrop deployment failed with HTTP $HTTP_CODE"
-            jq 'if .data then .data |= del(.deleteToken) else . end' response.json || cat response.json
-            exit 1
+          if jq empty response.json >/dev/null 2>&1; then
+            jq --arg http "$HTTP_CODE" \
+              'if .data then .data |= del(.deleteToken) else . end | . + {httpCode:$http}' \
+              response.json > deployment-report.json
+          else
+            jq -n --arg http "$HTTP_CODE" --rawfile body response.json \
+              '{httpCode:$http, rawResponse:$body}' > deployment-report.json
           fi
 
-          URL=$(jq -r '.data.url // empty' response.json)
-          if [ -z "$URL" ]; then
-            echo 'Deployment response did not contain a URL.'
-            exit 1
+          if [ "$HTTP_CODE" = "201" ]; then
+            URL=$(jq -r '.data.url // empty' response.json)
+            echo "url=$URL" >> "$GITHUB_OUTPUT"
+            printf '%s\n' "$URL" > live-url.txt
+            echo "Deployment succeeded: $URL"
+          else
+            echo "PageDrop returned HTTP $HTTP_CODE; diagnostic artifact will be uploaded."
           fi
 
-          echo "url=$URL" >> "$GITHUB_OUTPUT"
-          printf '%s\n' "$URL" > live-url.txt
-          {
-            echo '## World Cup Forecast live site'
-            echo
-            echo "$URL"
-          } >> "$GITHUB_STEP_SUMMARY"
-          echo "Deployment succeeded: $URL"
+      - name: Upload deployment diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pagedrop-deployment-report
+          path: deployment-report.json
+          retention-days: 7
 
       - name: Upload live URL
+        if: steps.deploy.outputs.http_code == '201'
         uses: actions/upload-artifact@v4
         with:
           name: pagedrop-live-url
           path: live-url.txt
           retention-days: 7
+
+      - name: Validate deployment
+        if: steps.deploy.outputs.http_code != '201'
+        shell: bash
+        run: |
+          cat deployment-report.json
+          exit 1
