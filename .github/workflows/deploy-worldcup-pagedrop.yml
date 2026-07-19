@@ -1,4 +1,4 @@
-name: Deploy World Cup Forecast to PageDrop
+name: Deploy World Cup Forecast to Netlify
 
 on:
   workflow_dispatch:
@@ -30,93 +30,88 @@ jobs:
           sed -i 's/class="btn desktop" id="sourceBtn"/class="btn" id="sourceBtn"/' worldcup-real/index.html
           sed -i 's/class="btn" id="shareBtn"/class="btn desktop" id="shareBtn"/' worldcup-real/index.html
 
-      - name: Deploy permanent static page
+      - name: Deploy anonymous Netlify preview
         id: deploy
         shell: bash
         run: |
+          set +e
+          : > netlify-output.json
+          : > netlify-error.log
+          npx --yes netlify-cli@latest deploy \
+            --allow-anonymous \
+            --dir=worldcup-real \
+            --no-build \
+            --json > netlify-output.json 2> netlify-error.log
+          EXIT_CODE=$?
+          echo "exit_code=$EXIT_CODE" >> "$GITHUB_OUTPUT"
+
           python3 - <<'PY'
           import json
           import os
-          import urllib.error
-          import urllib.request
           from pathlib import Path
 
-          report_path = Path('deployment-report.json')
-          live_path = Path('live-url.txt')
-          output_path = Path(os.environ['GITHUB_OUTPUT'])
-          report = {'status': 'unknown'}
-          status = 0
-
+          stdout = Path('netlify-output.json').read_text(encoding='utf-8', errors='replace')
+          stderr = Path('netlify-error.log').read_text(encoding='utf-8', errors='replace')
+          parsed = None
           try:
-              html = Path('worldcup-real/index.html').read_text(encoding='utf-8')
-              slug = f"worldcup-forecast-{os.environ['GITHUB_SHA'][:8].lower()}"
-              payload = json.dumps({
-                  'html': html,
-                  'slug': slug,
-                  'ogTitle': 'World Cup Forecast Lab',
-                  'ogDescription': '真实 Elo、近5场状态与 FIFA xG 驱动的世界杯概率模型',
-              }, ensure_ascii=False).encode('utf-8')
-              request = urllib.request.Request(
-                  'https://pagedrop.dev/api/v1/sites',
-                  data=payload,
-                  headers={'Content-Type': 'application/json', 'User-Agent': 'WorldCupForecastLab/1.0'},
-                  method='POST',
-              )
-              try:
-                  with urllib.request.urlopen(request, timeout=60) as response:
-                      status = response.status
-                      body = response.read().decode('utf-8', errors='replace')
-              except urllib.error.HTTPError as exc:
-                  status = exc.code
-                  body = exc.read().decode('utf-8', errors='replace')
+              parsed = json.loads(stdout)
+          except Exception:
+              start = stdout.find('{')
+              end = stdout.rfind('}')
+              if start >= 0 and end > start:
+                  try:
+                      parsed = json.loads(stdout[start:end + 1])
+                  except Exception:
+                      parsed = None
 
-              try:
-                  parsed = json.loads(body)
-              except json.JSONDecodeError:
-                  parsed = {'rawResponse': body}
-              if isinstance(parsed, dict) and isinstance(parsed.get('data'), dict):
-                  parsed['data'].pop('deleteToken', None)
-              report = {'httpCode': status, 'response': parsed}
+          report = {
+              'exitCode': int(os.environ.get('EXIT_CODE_FOR_REPORT', '0')),
+              'stdout': parsed if parsed is not None else stdout,
+              'stderr': stderr,
+          }
+          Path('deployment-report.json').write_text(
+              json.dumps(report, ensure_ascii=False, indent=2), encoding='utf-8'
+          )
 
-              if status == 201 and isinstance(parsed, dict):
-                  url = parsed.get('data', {}).get('url', '')
-                  if url:
-                      live_path.write_text(url + '\n', encoding='utf-8')
-                      with output_path.open('a', encoding='utf-8') as out:
-                          out.write(f'url={url}\n')
-                  else:
-                      report['error'] = '201 response contained no public URL'
-          except Exception as exc:
-              report = {
-                  'httpCode': status,
-                  'exceptionType': type(exc).__name__,
-                  'exception': str(exc),
-              }
-
-          report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding='utf-8')
-          with output_path.open('a', encoding='utf-8') as out:
-              out.write(f'http_code={status}\n')
-          print(json.dumps(report, ensure_ascii=False))
+          if isinstance(parsed, dict):
+              url = parsed.get('deploy_url') or parsed.get('deployUrl') or parsed.get('url')
+              claim = parsed.get('claim_url') or parsed.get('claimUrl')
+              if url:
+                  Path('live-url.txt').write_text(str(url) + '\n', encoding='utf-8')
+                  with Path(os.environ['GITHUB_OUTPUT']).open('a', encoding='utf-8') as out:
+                      out.write(f'url={url}\n')
+              if claim:
+                  Path('claim-url.txt').write_text(str(claim) + '\n', encoding='utf-8')
+                  with Path(os.environ['GITHUB_OUTPUT']).open('a', encoding='utf-8') as out:
+                      out.write(f'claim_url={claim}\n')
           PY
+        env:
+          EXIT_CODE_FOR_REPORT: ${{ steps.deploy.outputs.exit_code }}
 
-      - name: Upload deployment diagnostics
+      - name: Upload deployment report
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: pagedrop-deployment-report
-          path: deployment-report.json
+          name: netlify-deployment-report
+          path: |
+            deployment-report.json
+            netlify-output.json
+            netlify-error.log
           retention-days: 7
 
       - name: Upload live URL
-        if: steps.deploy.outputs.http_code == '201'
+        if: steps.deploy.outputs.url != ''
         uses: actions/upload-artifact@v4
         with:
-          name: pagedrop-live-url
-          path: live-url.txt
+          name: netlify-live-url
+          path: |
+            live-url.txt
+            claim-url.txt
+          if-no-files-found: ignore
           retention-days: 7
 
       - name: Validate deployment
-        if: steps.deploy.outputs.http_code != '201'
+        if: steps.deploy.outputs.url == ''
         shell: bash
         run: |
           cat deployment-report.json
