@@ -1,0 +1,73 @@
+name: Deploy World Cup Forecast to PageDrop
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'worldcup-real/**'
+      - '.github/workflows/deploy-worldcup-pagedrop.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Prepare mobile-friendly build
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Keep data provenance accessible on mobile while hiding the less essential share button.
+          sed -i 's/class="btn desktop" id="sourceBtn"/class="btn" id="sourceBtn"/' worldcup-real/index.html
+          sed -i 's/class="btn" id="shareBtn"/class="btn desktop" id="shareBtn"/' worldcup-real/index.html
+
+      - name: Deploy permanent static page
+        id: deploy
+        shell: bash
+        run: |
+          set -euo pipefail
+          SLUG="worldcup-forecast-${GITHUB_SHA::8}"
+          jq -n \
+            --rawfile html worldcup-real/index.html \
+            --arg slug "$SLUG" \
+            --arg title "World Cup Forecast Lab" \
+            --arg description "真实 Elo、近5场状态与 FIFA xG 驱动的世界杯概率模型" \
+            '{html:$html, slug:$slug, ogTitle:$title, ogDescription:$description}' > payload.json
+
+          HTTP_CODE=$(curl -sS -o response.json -w '%{http_code}' \
+            -X POST 'https://pagedrop.dev/api/v1/sites' \
+            -H 'Content-Type: application/json' \
+            --data-binary @payload.json)
+
+          if [ "$HTTP_CODE" != "201" ]; then
+            echo "PageDrop deployment failed with HTTP $HTTP_CODE"
+            jq 'if .data then .data |= del(.deleteToken) else . end' response.json || cat response.json
+            exit 1
+          fi
+
+          URL=$(jq -r '.data.url // empty' response.json)
+          if [ -z "$URL" ]; then
+            echo 'Deployment response did not contain a URL.'
+            exit 1
+          fi
+
+          echo "url=$URL" >> "$GITHUB_OUTPUT"
+          printf '%s\n' "$URL" > live-url.txt
+          {
+            echo '## World Cup Forecast live site'
+            echo
+            echo "$URL"
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "Deployment succeeded: $URL"
+
+      - name: Upload live URL
+        uses: actions/upload-artifact@v4
+        with:
+          name: pagedrop-live-url
+          path: live-url.txt
+          retention-days: 7
