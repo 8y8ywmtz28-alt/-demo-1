@@ -34,28 +34,36 @@ jobs:
         id: deploy
         shell: bash
         run: |
-          set -u
+          set +e
           SLUG="worldcup-forecast-${GITHUB_SHA::8}"
+          : > response.json
+          : > curl-error.txt
+          : > live-url.txt
+          : > deployment-report.json
+
           jq -n \
             --rawfile html worldcup-real/index.html \
             --arg slug "$SLUG" \
             --arg title "World Cup Forecast Lab" \
             --arg description "真实 Elo、近5场状态与 FIFA xG 驱动的世界杯概率模型" \
             '{html:$html, slug:$slug, ogTitle:$title, ogDescription:$description}' > payload.json
+          JQ_EXIT=$?
 
           HTTP_CODE=$(curl -sS -o response.json -w '%{http_code}' \
             -X POST 'https://pagedrop.dev/api/v1/sites' \
             -H 'Content-Type: application/json' \
-            --data-binary @payload.json || printf '000')
+            --data-binary @payload.json 2>curl-error.txt)
+          CURL_EXIT=$?
+          [ -n "$HTTP_CODE" ] || HTTP_CODE="000"
           echo "http_code=$HTTP_CODE" >> "$GITHUB_OUTPUT"
 
           if jq empty response.json >/dev/null 2>&1; then
-            jq --arg http "$HTTP_CODE" \
-              'if .data then .data |= del(.deleteToken) else . end | . + {httpCode:$http}' \
+            jq --arg http "$HTTP_CODE" --argjson curlExit "$CURL_EXIT" --argjson jqExit "$JQ_EXIT" --rawfile curlError curl-error.txt \
+              'if .data then .data |= del(.deleteToken) else . end | . + {httpCode:$http,curlExit:$curlExit,jqExit:$jqExit,curlError:$curlError}' \
               response.json > deployment-report.json
           else
-            jq -n --arg http "$HTTP_CODE" --rawfile body response.json \
-              '{httpCode:$http, rawResponse:$body}' > deployment-report.json
+            jq -n --arg http "$HTTP_CODE" --argjson curlExit "$CURL_EXIT" --argjson jqExit "$JQ_EXIT" --rawfile body response.json --rawfile curlError curl-error.txt \
+              '{httpCode:$http,curlExit:$curlExit,jqExit:$jqExit,curlError:$curlError,rawResponse:$body}' > deployment-report.json
           fi
 
           if [ "$HTTP_CODE" = "201" ]; then
@@ -64,8 +72,9 @@ jobs:
             printf '%s\n' "$URL" > live-url.txt
             echo "Deployment succeeded: $URL"
           else
-            echo "PageDrop returned HTTP $HTTP_CODE; diagnostic artifact will be uploaded."
+            echo "PageDrop request completed with HTTP $HTTP_CODE and curl exit $CURL_EXIT."
           fi
+          exit 0
 
       - name: Upload deployment diagnostics
         if: always()
